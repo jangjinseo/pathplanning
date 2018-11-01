@@ -10,13 +10,26 @@
 #include <nav_msgs/OccupancyGrid.h>
 #include <geometry_msgs/Point.h>
 #include <sensor_msgs/PointCloud.h>
+#include <actionlib_msgs/GoalStatusArray.h>
+#include <math.h>
+#include <sensor_msgs/LaserScan.h>
+#include <keyboard/Key.h>
+
+
+
 
 #define UP 1
 #define DOWN 2
 #define FU 3
 #define FD 4
-
-
+#define GG 5
+#define GSG 6
+#define HUMAN 1
+#define ROBOT 2
+#define MIN(X,Y) ((X) < (Y) ? (X) : (Y))  
+#define DISF 0.7
+#define DISS 0.7
+#define PI 3.14
 #define V_W 300
 #define V_H 300
 #define V_SIZE V_H * V_W
@@ -38,26 +51,94 @@ nav_msgs::OccupancyGrid localmap_;
 nav_msgs::OccupancyGrid potential_;
 vector<int> l_p;
 
+rm::Point32 foots[2];
+
 std::vector<std::pair<int,std::pair<int,int> > > node_vc;
 std::queue<int> rbque;
 ros::Publisher vmap_pub;
 ros::Publisher node_pose_pub;
 ros::Publisher cmdvel_pub;
 ros::Publisher potential_pub;
+ros::Publisher bang_pub;
 double py_;
+double dis_f_ = 999999, dis_r_, dis_l_;
 int st_;
-
-
+int mystatus_;
+int keydown[5] = {0,0,0,0,0};
 // 이동하면서 후보노드 탐색하는 벡터생성
 vector<std::pair<int,int> > candi_left, candi_right;
 int visited[V_SIZE];
-
+int mode = HUMAN;
 
 void poseCallback(const nav_msgs::Odometry::ConstPtr& odom){
   mypose_ = odom->pose.pose;
   //ROS_INFO("%f",odom->pose.pose.position.x);
 }
 
+void footprintCallback(const rm::PolygonStamped::ConstPtr& foot){
+   if(!foot->polygon.points.empty()){
+       foots[0] = foot->polygon.points[0];
+       foots[1] = foot->polygon.points[1];
+   }
+}
+
+void keyDownCallback(const keyboard::Key::ConstPtr& key){
+    int k = key->code;
+    if(k==97){
+        keydown[0] = 1;
+    }else if(k==119){
+        keydown[1] = 1;
+    }else if(k==100){
+        keydown[2] = 1;
+    }else if(k==115){
+        keydown[3] = 1;
+    }else if(k==114){
+        if(keydown[4] == 0 && mode == HUMAN){
+            mode = ROBOT;
+            ROS_INFO("mode ROBOT");
+        }else if(keydown[4] == 0 && mode==ROBOT){
+            mode = HUMAN;
+            ROS_INFO("mode HUMAN");
+            rbque.pop();
+
+        }
+
+        rm::Twist cmd;
+        cmd.linear.x = 0;
+        cmd.angular.z = 0;
+        cmdvel_pub.publish(cmd);
+
+        keydown[4] = 1;
+    }
+//    ROS_INFO("keydown : {%d}",k);
+
+}
+void keyUpCallback(const keyboard::Key::ConstPtr& key){
+    int k = key->code;
+    if(k==97){
+        keydown[0] = 0;
+    }else if(k==119){
+        keydown[1] = 0;
+    }else if(k==100){
+        keydown[2] = 0;
+    }else if(k==115){
+        keydown[3] = 0;
+    }else if(k==114){
+        keydown[4] = 0;
+    }
+//    ROS_INFO("keyup : {%d}",k);
+
+   
+}
+void cloudCallback(const sensor_msgs::LaserScan::ConstPtr& cloud){
+    for(int i=0;i<40;i++){
+        dis_f_ = MIN(dis_f_, cloud->ranges[i]);
+    }
+    for(int i=320;i<358;i++){
+        dis_f_ = MIN(dis_f_, cloud->ranges[i]);
+    }
+     
+}
 void mapCallback(const nav_msgs::OccupancyGrid::ConstPtr& map){
   map_ = *map;
 
@@ -114,8 +195,7 @@ bool worldToMap(double wx, double wy, unsigned int& mx, unsigned int& my) {
       return false;
 }
 
-bool isInBox(int tx, int ty, int ix, int iy){
-  int box = 2;
+bool isInBox(int tx, int ty, int ix, int iy, int box){
   if(tx - box < ix && tx + box > ix && ty - box < iy && ty + box > iy){
     return true;
   }
@@ -174,41 +254,32 @@ void visitedUpdate(unsigned int x, unsigned int y, int num){
   }
 }
 int getState(int x,int y){
+    if(x > map_.info.width || x < 0)
+        return -1;
+    if(y > map_.info.height || y < 0)
+        return -1;
     return map_.data[y*map_.info.width + x];
 }
 int getVState(int x,int y){
    return visited[y*V_W + x];
 }
-void make_node(int v_mx, int v_my, int st){
-  node_vc.push_back(std::make_pair(st,std::make_pair(v_mx,v_my)));
+void make_node(int mx, int my, int st){
+  node_vc.push_back(std::make_pair(st,std::make_pair(mx,my)));
 }
-void send_goal(MoveBaseClient* ac, double x, double y){
+void send_goal(MoveBaseClient* ac, double mx, double my, double tx, double ty){
   move_base_msgs::MoveBaseGoal tempgoal;
 
   tempgoal.target_pose.header.frame_id = "map";
   tempgoal.target_pose.header.stamp = ros::Time::now();
-  tempgoal.target_pose.pose.position.x = x;
-  tempgoal.target_pose.pose.position.y = y;
+  tempgoal.target_pose.pose.position.x = tx;
+  tempgoal.target_pose.pose.position.y = ty;
   tempgoal.target_pose.pose.orientation.w = 1.0;
 
   ac->sendGoal(tempgoal);
   ROS_INFO("Sending goal");
+
 }
-void send_goal_map(MoveBaseClient* ac, unsigned int mx, unsigned int my){
-  double x,y;
-  mapToWorld(mx,my,x,y);
 
-  move_base_msgs::MoveBaseGoal tempgoal;
-
-  tempgoal.target_pose.header.frame_id = "map";
-  tempgoal.target_pose.header.stamp = ros::Time::now();
-  tempgoal.target_pose.pose.position.x = x;
-  tempgoal.target_pose.pose.position.y = y;
-  tempgoal.target_pose.pose.orientation.w = 1.0;
-
-  ac->sendGoal(tempgoal);
-  ROS_INFO("Sending goal");
-}
 void publish_node_pose(){
   if(!node_vc.empty()){
     sensor_msgs::PointCloud tmp;
@@ -227,6 +298,8 @@ void publish_node_pose(){
       point.y = wy;// - offy; 
       point.z = 0;
       tmp.points.push_back(point);
+
+      ROS_INFO("pub node");
     }
     node_pose_pub.publish(tmp);
 
@@ -282,20 +355,79 @@ bool getStatebool(int x,int y){
 
     // Lidar 센서로 대체인식 예정.
   int m = map_.data[y*map_.info.width + x];
-  if(m == 100){
+  if(m == 100 || m== -1){
     return true;
   }
   return false;
 }
-void eraseNode(int v_mx, int v_my){
+void eraseNode(int mx, int my){
   for(int i=0;i<node_vc.size();i++){
-    if(isInBox(v_mx,v_my,node_vc[i].second.first, node_vc[i].second.second)){
+    if(isInBox(mx,my,node_vc[i].second.first, node_vc[i].second.second, 4)){
       node_vc.erase(node_vc.begin()+i);
     }
   }
 }
 void go_front(int mx,int my){
   //publish(cmd_vel);
+}
+bool isSuccess(int x,int y){
+  int r = 5;
+  for(int dx=x-r;dx<x+r;dx++){
+    for(int dy=y-r;dy<y+r;dy++){
+      int st = getState(dx,dy);
+      if(st == 100 || st == -1 )
+        return false;
+    }
+  } 
+  return true;
+}
+int footprintCost(double x, double y){
+  unsigned int mx,my;
+  worldToMap(x,y,mx,my);
+  return getState(mx,my);
+}
+
+bool turnto(double* twist_z, rm::Quaternion &mr, double tr){
+  //ROS_INFO("/%f %f/",mr,tr);
+
+
+  tf::Quaternion q(mr.x, mr.y, mr.z, mr.w);
+  tf::Matrix3x3 m(q);
+  double roll, pitch, yaw;
+  m.getRPY(roll, pitch, yaw);
+
+  ROS_INFO("turn to %f %f", yaw, tr);
+ 
+  
+  
+  if(yaw > tr){
+    if(yaw - tr < 0.05){
+        return false;
+    }
+    *twist_z = (tr-yaw); 
+ 
+  }else if(yaw < tr){
+   if(tr - yaw < 0.05){
+        return false;
+    }
+    *twist_z = (tr-yaw);
+  }
+
+
+ 
+ /*
+
+  double w;
+  if(mr > tr + 0.05 && mr < 1){
+      w = (tr - mr)*2;
+  }else if(mr < tr - 0.05 && mr > -1){
+      w = -(tr - mr)*2;
+  }else{
+      return false;
+  }
+  *twist_z = w;
+  */
+  return true;
 }
 int main(int argc, char** argv){
   ros::init(argc, argv, "simple_navigation_goals");
@@ -311,24 +443,49 @@ int main(int argc, char** argv){
   ros::Subscriber pose_sub_ = private_nh.subscribe<nav_msgs::Odometry>("odom", 100, &poseCallback);
   ros::Subscriber map_sub_ = private_nh.subscribe<nav_msgs::OccupancyGrid>("map", 100, &mapCallback);
   ros::Subscriber local_map_sub = private_nh.subscribe<nav_msgs::OccupancyGrid>("/move_base/local_costmap/costmap", 100, &localmapCallback);
+  ros::Subscriber footprint_sub = private_nh.subscribe<rm::PolygonStamped>("/move_base/local_costmap/footprint",100,&footprintCallback);
+  ros::Subscriber cloud_sub  = private_nh.subscribe<sensor_msgs::LaserScan>("/scan", 100, &cloudCallback);
+  ros::Subscriber remote_keydown = private_nh.subscribe<keyboard::Key>("/keyboard/keydown", 100, &keyDownCallback);
+  ros::Subscriber remote_keyup = private_nh.subscribe<keyboard::Key>("/keyboard/keyup", 100, &keyUpCallback);
+
+
+  bang_pub = private_nh.advertise<rm::PoseStamped>("bang", 100);
   vmap_pub = private_nh.advertise<nav_msgs::OccupancyGrid>("vmap", 100); 
   node_pose_pub = private_nh.advertise<sensor_msgs::PointCloud>("node_pose",100);
   cmdvel_pub = private_nh.advertise<rm::Twist>("cmd_vel",100);
   potential_pub = private_nh.advertise<nav_msgs::OccupancyGrid>("potential",100);
-  ros::Rate loop_rate(5);
-  bool okgo = false;
 
 
-    
+  ros::Rate loop_rate(10);
+
+bool okgo = false;
 // pair <int : 위방향 청소 1 아래방향 청소 2 // >
   
   while(ros::ok()){
-   
-    unsigned int mx, my;
+
+    if(mode == HUMAN){
+        rm::Twist cmd;
+        cmd.linear.x = 0;
+        cmd.angular.z = 0;
+        if(keydown[1] == 1){
+            cmd.linear.x = 2;
+        }else if(keydown[0] == 1){
+            cmd.angular.z = 1;
+        }else if(keydown[2] == 1){
+            cmd.angular.z = -1;
+        }else if(keydown[3] == 1){
+            cmd.linear.x = -2;
+        }
+
+        cmdvel_pub.publish(cmd);
+    }else{
+     unsigned int mx, my;
     unsigned int v_mx, v_my;
     double wx = mypose_.position.x, wy=mypose_.position.y;
     worldToMap(wx,wy,mx,my);
     worldToMap_v(wx,wy,v_mx,v_my);
+    
+    // worldToMap(
     //ROS_INFO("%d %d",v_mx,v_my);
     // 현재 위치를 visit 배열에 업데이트
     visitedUpdate(v_mx,v_my,2);
@@ -345,92 +502,161 @@ int main(int argc, char** argv){
     potential_pub.publish(potential_);
     // 위치정보 토픽을 제대로 입력받으면 mx가 0이아님
     if(mx != 0){
-
+      
       // 아무 수행이나 노드없으면 아래 청소노드 추가
       if(rbque.empty() && node_vc.empty()){
-        ROS_INFO("first node added");
-        make_node(v_mx, v_my, DOWN);
+        //ROS_INFO("my rotate : %f %f",mypose_.orientation.z,mypose_.orientation.w);
+        make_node(mx, my+10, DOWN);
       }
 
-      // 수행목표지점에 도착했을때
-      if(rbque.empty()){
+          // 수행목표지점에 도착했을때
+      if(rbque.empty() && !node_vc.empty()){
         // 목표 노드에 도착했으면 해당노드제거 후 수행명령큐에 명령삽입
-          
-
+                
           int tx, ty;
           tx = node_vc.back().second.first;
           ty = node_vc.back().second.second;
-          
-            ROS_INFO("node send goal : %d",node_vc.size());
-            double dx,dy;
-            mapToWorld_v(tx,ty,dx,dy);
-            send_goal(&ac, dx, dy);
-            rbque.push(5);
-          
+     
+       
+          double gtx,gty;
+          mapToWorld(tx,ty,gtx,gty);  
+          double pz = atan2((gty-wy),(gtx-wx));
+  //        ROS_INFO("%f pz", atan2((gty-wy),(gtx-wx)));
+
+          rm::Twist cmd;
+          double w;
+  //        ROS_INFO("[%f %f]",mypose_.orientation.z, pz);
+            
+//   
+//                  send_goal(&ac,wx,wy, gtx, gty);
+//                  rbque.push(GG);
+//       continue;
+
+//   
+//          if(mypose_.orientation.z > pz + 0.05 && mypose_.orientation.z < 1){
+//              cmd.angular.z = (pz - mypose_.orientation.z)*2;
+//          }else if(mypose_.orientation.z < pz - 0.05 && mypose_.orientation.z > -1){
+//              cmd.angular.z = (pz - mypose_.orientation.z)*2;
+//          }
+//          
+          if(turnto(&w, mypose_.orientation, pz)){
+              cmd.angular.z = w;
+          }else{
+    //          ROS_INFO("foot 1 : %f %f", foots[0].x, foots[0].y);
+    //          ROS_INFO("foot 2 : %f %f", foots[1].x, foots[1].y);
+             
+              double diff_x = gtx - wx;
+              double diff_y = gty - wy;
+              double target_x[2];
+              double target_y[2];   
+
+              bool done = false;
+             
+              double scale = 1;//abs(diff_x);
+              double dScale = 0.01;//diff_x/100;
+              
+//              if(footprintCost(foots[0].x, foots[0].y) == 0){
+//                   okgo = true;
+//              }
+//
+              while(!done)
+              {
+                if(scale < 0)
+                {
+                  okgo = true;
+                  done = true;  
+                }
+                for(int i=0;i<2;i++){
+                  target_x[i] = foots[i].x + scale * diff_x;
+                  target_y[i] = foots[i].y + scale * diff_y;
+                
+                 if(footprintCost(target_x[i], target_y[i]) != 0){
+                    done = true;
+                 }
+                }
+                
+                scale -=dScale;
+              }
+      //        ROS_INFO("seieii"); 
+
+              if(!okgo){
+
+//                  ROS_INFO("node send goal : %d",node_vc.size());
+                
+                 
+                  send_goal(&ac,wx,wy, gtx, gty);
+                  rbque.push(GG);
+       
+              }else{
+                  okgo =false;
+                  rbque.push(GSG);
+              }
+                  
+              
+          }
+
+          cmdvel_pub.publish(cmd);
+
+
       }else{
+
+          //ROS_INFO("node size : [%d]", node_vc.size()); 
           int st = rbque.front();
           if(st == FD || st == FU){
               // 현재위치에 해당되는 노드가 노드벡터안에 있을경우 해당노드삭제
-              eraseNode(v_mx,v_my);
+              eraseNode(mx,my);
         
             // 벡터에 왼쪽부터 들어가므로 맨마지막에 들어가는 건 오른쪽임.
-              ROS_INFO("%d, %f",okgo, mypose_.orientation.z);
-              // 왼쪽 탐색
-                if(getState(mx,my-10) == 0 && getVState(v_mx,v_my-VRANGE) == 0){
-                    visitedUpdate(v_mx,v_my-VRANGE,1);
-                    candi_left.push_back(std::make_pair(v_mx,v_my-VRANGE));
-                    
-                }
-              // 오른쪽 탐색
-                if(getState(mx,my+10) == 0 && getVState(v_mx,v_my+VRANGE) == 0){
-                    visitedUpdate(v_mx,v_my+VRANGE,1);
-                    candi_right.push_back(std::make_pair(v_mx,v_my+VRANGE));
-                    
-                }
+   //           ROS_INFO("%f, %f",mypose_.orientation.w, mypose_.orientation.z);
 
+              unsigned int tmx, tmy, tvx, tvy;
+              worldToMap(wx, wy-0.5,tmx,tmy);
+              worldToMap_v(wx, wy-0.5,tvx,tvy);  
+              // 왼쪽 탐색
+               if(isSuccess(tmx, tmy) && getVState(tvx,tvy) == 0){
+                
+                    visitedUpdate(tvx,tvy,1);
+                    candi_left.push_back(std::make_pair(tmx,tmy));
+               }
+             
+              worldToMap(wx, wy+0.5,tmx,tmy);
+              worldToMap_v(wx, wy+0.5,tvx,tvy);  
+              // 오른쪽 탐색
+               if(isSuccess(tmx, tmy) && getVState(tvx,tvy) == 0){
+                    visitedUpdate(tvx,tvy,1);
+                    candi_right.push_back(std::make_pair(tmx,tmy));
+                }
+               
               if(st == FD){
                
                 rm::Twist cmd;
 
-                ROS_INFO("///%d///", mx);
+//                ROS_INFO("FD!");
                 if(okgo){
+//                  ROS_INFO("FD - okgo");
                     cmd.linear.x = 0.5;
                     cmd.linear.y = 0;
                     cmd.linear.z = 0;
-                    cmd.angular.z = py_-wy;
-                    for(int i=mx;i<mx+30;i++){
-                        if(getStatebool(i,my)){
-                             ROS_INFO("kiallalalla");
-                             cmd.linear.x = 0;
-                             cmd.linear.y = 0;
-                             cmd.linear.z = 0;
-                             cmd.angular.z = 0.4;
-                             merge(st, mx, my);
-                             rbque.pop();
-                             okgo = false;                    
-                            break;
-                        }
-                    }
-                }else{
-                    if(mypose_.orientation.z > 0.1){
-                        cmd.angular.z = -0.5;
-                    }else{
-                         okgo = true;
-                    }
-                }
-                
-                cmdvel_pub.publish(cmd);
-              }else if(st == FU){
-                
-                rm::Twist cmd;
+             //       cmd.angular.z = (py_-wy)/2;
+                    ROS_INFO("cha : %f", -py_+wy);
+//                    for(int i=mx;i<mx+15;i++){
+//                        if(getStatebool(i,my)){
+//                          if(dis_f_ < 0.8 || dis_r_ < 0.5 || dis_l_ < 0.5){
+                        
+                      unsigned int t_x, t_y;
+                      double t_wx, t_wy;
+                  ROS_INFO("[%f %f] : my", wx,wy);
+   
+                  //    for(int i=0;i<3;i++){
+                  //        t_wx = wx-0.7*cos(acos(mypose_.orientation.z)*2 - PI/10 + i*(PI/10));
+                  //        t_wy = wy+0.7*sin(asin(mypose_.orientation.w)*2 - PI/10 + i*(PI/10));
+                   
+                   if(dis_f_ < DISF ){
+//                          worldToMap(t_wx, t_wy, t_x,t_y);
+ //                        ROS_INFO("[%f %f] : tx ty", t_wx,t_wy);
 
-                if(okgo){
-                    cmd.linear.x = 0.8;
-                    cmd.linear.y = 0;
-                    cmd.linear.z = 0;
-                    cmd.angular.z = py_-wy;
-                    for(int i=mx;i>mx-30;i--){
-                        if(getStatebool(i,my)){
+
+//                          if(getState(t_x,t_y) != 0){  
                              ROS_INFO("kiallalalla");
                              cmd.linear.x = 0;
                              cmd.linear.y = 0;
@@ -439,19 +665,69 @@ int main(int argc, char** argv){
                              merge(st, mx, my);
                              rbque.pop();
                              okgo = false;                    
-                            break;
-                        }
-                    }
+                            // ROS_INFO("node size : %d",rbque.size());
+                           }
+//                      }
                 }else{
-                    //if(mypose_.orientation.z > 1.1){
-                    //    cmd.angular.z = 0.4;
-                    if(mypose_.orientation.z < 0.9){
-                        cmd.angular.z = 0.4;
+                    double w;
+                    if(turnto(&w, mypose_.orientation, 0)){
+                        cmd.angular.z = w;
                     }else{
-                         okgo = true;
+                        okgo = true;
                     }
-                }
+               }
                 
+                cmdvel_pub.publish(cmd);
+              }else if(st == FU){
+                
+                rm::Twist cmd;
+    
+//                ROS_INFO("FU!");
+                if(okgo){
+//                    ROS_INFO("FU - okgo");
+                    cmd.linear.x = 0.5;
+                    cmd.linear.y = 0;
+                    cmd.linear.z = 0;
+                    cmd.angular.z = (py_-wy)/2;
+                    ROS_INFO("cha : %f", py_-wy);
+                        
+                  unsigned int t_x, t_y;
+                  double t_wx, t_wy;
+                  
+                    ROS_INFO("[%f %f] : my", wx,wy);
+//                  for(int i=0;i<3;i++){
+//                      t_wx = wx-0.4*cos(acos(mypose_.orientation.z)*2 - PI/10 + i*(PI/10));
+//                      t_wy = wy+0.4*sin(asin(mypose_.orientation.w)*2 - PI/10 + i*(PI/10));
+                       worldToMap(t_wx, t_wy, t_x,t_y);
+                    
+
+                     ROS_INFO("[%f %f] : tx ty",t_wx, t_wy);
+
+ 
+ 
+//                      if(getState(t_x,t_y) != 0){  
+                  if(dis_f_ < DISF){
+
+                         ROS_INFO("kiallalalla");
+                         cmd.linear.x = 0;
+                         cmd.linear.y = 0;
+                         cmd.linear.z = 0;
+                         cmd.angular.z = 0;
+                         merge(st, mx, my);
+                         rbque.pop();
+                         okgo = false;
+                       //  ROS_INFO("node size : %d",rbque.size());                    
+                       }
+//                  }
+                }else{
+                   double w;
+                    if(turnto(&w, mypose_.orientation, 3.14)){
+                        cmd.angular.z = w;
+                    }else{
+                        okgo = true;
+                    }
+ 
+                }
                 cmdvel_pub.publish(cmd);
               }
           }else if(st==DOWN || st==UP){
@@ -465,21 +741,60 @@ int main(int argc, char** argv){
                 rbque.pop();
                 rbque.push(FU);
               }
-          }else{
-              int tx, ty;
-              tx = node_vc.back().second.first;
-              ty = node_vc.back().second.second;
-ROS_INFO("gf");
-              if(isInBox(tx, ty, v_mx, v_my)){
+          }else if(st == GG){
+        
+           int tx, ty;
+            tx = node_vc.back().second.first;
+            ty = node_vc.back().second.second;
+
+
+              if(isInBox(tx, ty, mx, my,3)){
                 ac.cancelAllGoals();
                 ROS_INFO("pop back [%d]",node_vc.back().first);
                 rbque.pop();
                 rbque.push(node_vc.back().first);
                 node_vc.pop_back();
               }
+
+          }else if(st == GSG){
+        
+            int tx, ty;
+            tx = node_vc.back().second.first;
+            ty = node_vc.back().second.second;
+
+ROS_INFO("GO SIMPLE");
+        
+             rm::Twist cmd;
+
+             cmd.linear.x = 0.4;
+             cmd.linear.y = 0;
+             cmd.linear.z = 0;
+             cmd.angular.z = 0;//(py_-wy)/2;
+            
+             unsigned int t_x, t_y;
+             double t_wx, t_wy;
+             t_wx = wx-0.5*cos(acos(mypose_.orientation.z)*2);
+             t_wy = wy+0.5*sin(asin(mypose_.orientation.w)*2);
+             worldToMap(t_wx, t_wy, t_x,t_y);
+
+
+            //  if(getState(t_x,t_y) != 0 || isInBox(tx, ty, mx, my,3)){
+             if(isInBox(tx,ty,mx,my,3)){
+                ac.cancelAllGoals();
+
+                cmd.linear.x = 0;
+
+                ROS_INFO("pop back [%d]",node_vc.back().first);
+                rbque.pop();
+                rbque.push(node_vc.back().first);
+                node_vc.pop_back();
+             }
+                    
+              cmdvel_pub.publish(cmd);
           }
         
         }
+    }
     }
     ros::spinOnce();
     loop_rate.sleep();

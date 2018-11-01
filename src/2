@@ -1,0 +1,12 @@
+//
+//  move_base_msgs::MoveBaseGoal tempgoal;
+//
+//  tempgoal.target_pose.header.frame_id = "map";
+//  tempgoal.target_pose.header.stamp = ros::Time::now();
+//  tempgoal.target_pose.pose.position.x = x;
+//  tempgoal.target_pose.pose.position.y = y;
+//  tempgoal.target_pose.pose.orientation.w = 1.0;
+//
+//  ac->sendGoal(tempgoal);
+//  ROS_INFO("Sending goal");
+
